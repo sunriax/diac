@@ -1,0 +1,191 @@
+name: DIAC Release Pipeline
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+jobs:
+  export-kicad:
+    env:
+      BaseFileName: "DIAC"
+      SchematicFileExtension: "kicad_sch"
+      PCBFileExtension: "kicad_pcb"
+      OutputFolder: "./output"
+      ConfigFilePath: ".kibot/build.kibot.yaml"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Fetch repository
+      uses: actions/checkout@v4
+    - name: Copy License
+      run: |
+          mkdir ${{ env.OutputFolder }}
+          cp ./pcb/LICENSE ${{ env.OutputFolder }}
+    - name: Run KiBOT
+      uses: INTI-CMNB/KiBot@v2_k7
+      with:
+        config: ${{ env.ConfigFilePath }}
+        dir: ${{ env.OutputFolder }}
+        schema: "./pcb/${{ env.BaseFileName }}.${{ env.SchematicFileExtension }}"
+        board: "./pcb/${{ env.BaseFileName }}.${{ env.PCBFileExtension }}"
+    - name: Archive artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: kicad-export
+        path: ${{ env.OutputFolder }}
+        retention-days: 1
+
+  export-freecad:
+    env:
+      FREECADVERSION: "0.21.2"
+      FreeCADFileName: "./mechanical/housing.FCStd"
+      OutputFolder: "./output"
+      PartType: "PartDesign::Body"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Fetch repository
+      uses: actions/checkout@v4
+    - name: Copy License
+      run: |
+          mkdir ${{ env.OutputFolder }}
+          cp ./mechanical/LICENSE ${{ env.OutputFolder }}
+    - name: Install FreeCAD
+      run: |
+          wget https://github.com/FreeCAD/FreeCAD/releases/download/${{ env.FREECADVERSION }}/FreeCAD-${{ env.FREECADVERSION }}-Linux-x86_64.AppImage
+          chmod 0777 ./FreeCAD-${{ env.FREECADVERSION }}-Linux-x86_64.AppImage
+          ./FreeCAD-${{ env.FREECADVERSION }}-Linux-x86_64.AppImage --appimage-extract
+    - name: Get FreeCAD Export
+      run: |
+          git clone https://github.com/0x007E/pyfreecadexport.git
+    - name: Export STEP Files
+      run: |
+          ./squashfs-root/usr/bin/python ./pyfreecadexport/src/pyfreecadexport.py -f "${{ env.FreeCADFileName }}" -p "${{ env.PartType }}" -d "${{ env.OutputFolder }}" -e "step" -l "squashfs-root/usr/lib/"
+          ./squashfs-root/usr/bin/python ./pyfreecadexport/src/pyfreecadexport.py -f "${{ env.FreeCADFileName }}" -p "${{ env.PartType }}" -d "${{ env.OutputFolder }}" -e "stl" -l "squashfs-root/usr/lib/"
+    
+    - name: Archive artifacts
+      uses: actions/upload-artifact@v4
+      with:
+        name: freecad-export
+        path: ${{ env.OutputFolder }}
+        retention-days: 1
+    
+  build-firmware:
+    env:
+      TOOLCHAIN: "3.7.0.1796"
+      DFP: "ATtiny_DFP.2.0.368"
+      DEVICE: "attiny1606"
+      OutputFolder: "./output"
+      FirmwareName: "DIAC_FW_1_0"
+    runs-on: ubuntu-latest
+    steps:
+    - name: Fetch repository
+      uses: actions/checkout@v4
+    - name: Copy License
+      run: |
+          mkdir ${{ env.OutputFolder }}
+          cp ./firmware/LICENSE ${{ env.OutputFolder }}
+    - name: Install zip
+      run: sudo apt-get install -y zip
+    - name: install-build-tools
+      run: |
+          wget https://ww1.microchip.com/downloads/aemDocuments/documents/DEV/ProductDocuments/SoftwareTools/avr8-gnu-toolchain-${{ env.TOOLCHAIN }}-linux.any.x86_64.tar.gz
+          tar -xf *.tar.gz
+    - name: install-dfp-package
+      run: |
+          wget http://packs.download.atmel.com/Atmel.${{ env.DFP }}.atpack
+          unzip *.atpack -d ./DFP
+    - name: build-firmware
+      run: |
+          mkdir temp
+
+          libraries=""
+
+          for dir in ./firmware/lib/*/
+          do
+              name=${dir%*/}
+              echo "Building ${name##*/}"
+
+              first_file=$(ls ./firmware/lib/${name##*/}/*.c| head -1)
+              filename=$(basename -- "$first_file")
+              filename="${filename%.*}"
+
+              ./avr8-gnu-toolchain-linux_x86_64/bin/avr-gcc -g -x c -O1 -mmcu=${{ env.DEVICE }} -std=gnu99 -B ./DFP/gcc/dev/${{ env.DEVICE }} -I ./DFP/include -c ./firmware/lib/${name##*/}/${filename}.c -o ./temp/${filename}.o
+
+              libraries+="./temp/${filename}.o "
+          done
+
+          ./avr8-gnu-toolchain-linux_x86_64/bin/avr-gcc -g -x c -O1 -mmcu=${{ env.DEVICE }} -std=gnu99 -B ./DFP/gcc/dev/${{ env.DEVICE }} -I ./DFP/include -c ./firmware/${{ env.FirmwareName }}/main.c -o ./temp/main.o
+          ./avr8-gnu-toolchain-linux_x86_64/bin/avr-gcc -g -mmcu=${{ env.DEVICE }} -B ./DFP/gcc/dev/${{ env.DEVICE }} -I ./DFP/include -o ./temp/main.elf ./temp/main.o ${libraries}
+          
+          ./avr8-gnu-toolchain-linux_x86_64/bin/avr-objcopy -j .text -j .data -O ihex ./temp/main.elf ${{ env.OutputFolder }}/${{ env.FirmwareName }}_t1606.hex
+          ./avr8-gnu-toolchain-linux_x86_64/bin/avr-objcopy -j .eeprom --change-section-lma .eeprom=0 -O ihex ./temp/main.elf ${{ env.OutputFolder }}/${{ env.FirmwareName }}_t1606.eep
+
+          tar -czvf build.tar.gz ${{ env.OutputFolder }}
+          zip -r build.zip ${{ env.OutputFolder }}
+
+    - name: upload-firmware
+      uses: actions/upload-artifact@v4
+      with:
+        name: firmware-build
+        path: ${{ env.OutputFolder }}
+        retention-days: 1
+
+  create-release:
+    needs: [export-kicad, export-freecad, build-firmware]
+    runs-on: ubuntu-latest
+    steps:
+    - name: Create Release
+      id: create_release
+      uses: actions/create-release@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        tag_name: ${{ github.ref }}
+        release_name: Release ${{ github.ref }}
+        body: |
+            Release ${{ github.ref }}
+        draft: false
+        prerelease: false
+
+    - name: Download KiCad Artifacts
+      uses: actions/download-artifact@v2
+      with:
+        name: kicad-artifact
+        path: artifact/kicad
+        
+    - name: Upload KiCAD Asset
+      id: upload-kicad-asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: artifact/kicad
+        asset_name: kicad-release-artifact
+        asset_content_type: application/zip
+
+    - name: Download FreeCAD Artifacts
+      uses: actions/download-artifact@v2
+      with:
+        name: freecad-artifact
+        path: artifact/freecad
+
+    # - name: Download necessary Tools to modify Artifacts
+    #   run: |
+    #       git clone https://github.com/0x007E/pypdftool.git
+    #       git clone https://github.com/0x007E/pyqrtool.git
+    #       git clone https://github.com/0x007E/pyyourlstool.git
+
+    # - name: Modify Artifacts
+    #   run: |
+
+    - name: Upload FreeCAD Asset
+      id: upload-freecad-asset
+      uses: actions/upload-release-asset@v1
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+      with:
+        upload_url: ${{ steps.create_release.outputs.upload_url }}
+        asset_path: artifact/freecad
+        asset_name: freecad-release-artifact
+        asset_content_type: application/zip
